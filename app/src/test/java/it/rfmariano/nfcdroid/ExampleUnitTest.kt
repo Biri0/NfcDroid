@@ -1,17 +1,36 @@
 package it.rfmariano.nfcdroid
 
+import org.junit.Assert.assertEquals
 import org.junit.Test
+import java.nio.charset.StandardCharsets
 
-import org.junit.Assert.*
-
-/**
- * Example local unit test, which will execute on the development machine (host).
- *
- * See [testing documentation](http://d.android.com/tools/testing).
- */
 class ExampleUnitTest {
     @Test
-    fun addition_isCorrect() {
-        assertEquals(4, 2 + 2)
+    fun buildTextMessage_trimsOnSave() {
+        val normalized = NdefTextCodec.trimForSave(listOf("  first  ", "\tsecond\t"))
+        assertEquals(listOf("first", "second"), normalized)
+    }
+
+    @Test
+    fun trimForSave_keepsRecordOrder() {
+        val normalized = NdefTextCodec.trimForSave(listOf(" one ", " three ", " new four "))
+        assertEquals(listOf("one", "three", "new four"), normalized)
+    }
+
+    @Test
+    fun decodeTextPayload_utf8_keepsFullString() {
+        val text = "rfmariano.it"
+        val lang = "en".toByteArray(StandardCharsets.US_ASCII)
+        val payload = byteArrayOf(lang.size.toByte()) + lang + text.toByteArray(StandardCharsets.UTF_8)
+        assertEquals(text, NdefTextCodec.decodeTextPayload(payload))
+    }
+
+    @Test
+    fun decodeTextPayload_utf16_keepsFullString() {
+        val text = "rfmariano.it"
+        val lang = "en".toByteArray(StandardCharsets.US_ASCII)
+        val status = (0x80 or lang.size).toByte()
+        val payload = byteArrayOf(status) + lang + text.toByteArray(StandardCharsets.UTF_16BE)
+        assertEquals(text, NdefTextCodec.decodeTextPayload(payload))
     }
 }
