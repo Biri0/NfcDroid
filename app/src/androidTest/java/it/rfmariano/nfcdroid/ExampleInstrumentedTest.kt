@@ -28,7 +28,47 @@ class ExampleInstrumentedTest {
     }
 
     @Test
-    fun patchMessage_preservesNonTextAndOrder() {
+    fun editableRecordsFromMessage_supportsTextLinkPhoneAndEmail() {
+        val message = NdefMessage(
+            arrayOf(
+                NdefRecord.createTextRecord("en", "hello"),
+                NdefRecord.createUri("https://example.com"),
+                NdefRecord.createUri("tel:+123456789"),
+                NdefRecord.createUri("mailto:test@example.com")
+            )
+        )
+
+        val parsed = NdefTextCodec.editableRecordsFromMessage(message)
+
+        assertEquals(
+            listOf(
+                NdefTextCodec.EditableRecord(
+                    originalRecordIndex = 0,
+                    type = NdefTextCodec.EditableRecordType.TEXT,
+                    value = "hello"
+                ),
+                NdefTextCodec.EditableRecord(
+                    originalRecordIndex = 1,
+                    type = NdefTextCodec.EditableRecordType.LINK,
+                    value = "https://example.com"
+                ),
+                NdefTextCodec.EditableRecord(
+                    originalRecordIndex = 2,
+                    type = NdefTextCodec.EditableRecordType.PHONE,
+                    value = "+123456789"
+                ),
+                NdefTextCodec.EditableRecord(
+                    originalRecordIndex = 3,
+                    type = NdefTextCodec.EditableRecordType.EMAIL,
+                    value = "test@example.com"
+                )
+            ),
+            parsed
+        )
+    }
+
+    @Test
+    fun patchMessage_preservesUnsupportedRecordsAndAppendsNewMixedRecords() {
         val mimeRecord = NdefRecord(
             NdefRecord.TNF_MIME_MEDIA,
             "text/plain".toByteArray(),
@@ -39,21 +79,63 @@ class ExampleInstrumentedTest {
             arrayOf(
                 NdefRecord.createTextRecord("en", "old-1"),
                 mimeRecord,
-                NdefRecord.createTextRecord("en", "old-2")
+                NdefRecord.createUri("tel:+111")
             )
         )
         val edited = listOf(
-            NdefTextCodec.EditableTextRecord(originalRecordIndex = 0, text = "  new-1  "),
-            NdefTextCodec.EditableTextRecord(originalRecordIndex = null, text = "  new-3  ")
+            NdefTextCodec.EditableRecord(
+                originalRecordIndex = 0,
+                type = NdefTextCodec.EditableRecordType.TEXT,
+                value = "  new-1  "
+            ),
+            NdefTextCodec.EditableRecord(
+                originalRecordIndex = 2,
+                type = NdefTextCodec.EditableRecordType.PHONE,
+                value = "  +222  "
+            ),
+            NdefTextCodec.EditableRecord(
+                originalRecordIndex = null,
+                type = NdefTextCodec.EditableRecordType.EMAIL,
+                value = "  new@example.com  "
+            ),
+            NdefTextCodec.EditableRecord(
+                originalRecordIndex = null,
+                type = NdefTextCodec.EditableRecordType.LINK,
+                value = "  https://github.com  "
+            )
         )
 
         val patched = NdefTextCodec.patchMessage(original, edited)
+        val parsedPatchedRecords = NdefTextCodec.editableRecordsFromMessage(patched)
 
-        assertEquals(3, patched.records.size)
-        assertEquals("new-1", NdefTextCodec.parseTextRecords(NdefMessage(arrayOf(patched.records[0]))).single())
+        assertEquals(5, patched.records.size)
         assertEquals(mimeRecord.tnf, patched.records[1].tnf)
         assertTrue(mimeRecord.type.contentEquals(patched.records[1].type))
         assertTrue(mimeRecord.payload.contentEquals(patched.records[1].payload))
-        assertEquals("new-3", NdefTextCodec.parseTextRecords(NdefMessage(arrayOf(patched.records[2]))).single())
+        assertEquals(
+            listOf(
+                NdefTextCodec.EditableRecord(
+                    originalRecordIndex = 0,
+                    type = NdefTextCodec.EditableRecordType.TEXT,
+                    value = "new-1"
+                ),
+                NdefTextCodec.EditableRecord(
+                    originalRecordIndex = 2,
+                    type = NdefTextCodec.EditableRecordType.PHONE,
+                    value = "+222"
+                ),
+                NdefTextCodec.EditableRecord(
+                    originalRecordIndex = 3,
+                    type = NdefTextCodec.EditableRecordType.EMAIL,
+                    value = "new@example.com"
+                ),
+                NdefTextCodec.EditableRecord(
+                    originalRecordIndex = 4,
+                    type = NdefTextCodec.EditableRecordType.LINK,
+                    value = "https://github.com"
+                )
+            ),
+            parsedPatchedRecords
+        )
     }
 }

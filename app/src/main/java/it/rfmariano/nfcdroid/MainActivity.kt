@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.OutlinedButton
@@ -28,6 +29,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import it.rfmariano.nfcdroid.ui.theme.NfcDroidTheme
@@ -40,14 +42,21 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
         WAITING_NEXT_SCAN
     }
 
+    private sealed interface WriteMessagePreparation {
+        data class Ready(val message: NdefMessage) : WriteMessagePreparation
+        data object Empty : WriteMessagePreparation
+        data class Invalid(val reason: String) : WriteMessagePreparation
+    }
+
     private var nfcAdapter: NfcAdapter? = null
     private var currentTag: Tag? = null
     private var originalMessage: NdefMessage? = null
-    private var editableTextRecords by mutableStateOf<List<NdefTextCodec.EditableTextRecord>>(emptyList())
+    private var editableRecords by mutableStateOf<List<NdefTextCodec.EditableRecord>>(emptyList())
+    private var newRecordType by mutableStateOf(NdefTextCodec.EditableRecordType.TEXT)
     private var newRecordValue by mutableStateOf("")
     private var writeState by mutableStateOf(WriteState.IDLE)
     private var armedTagId: ByteArray? = null
-    private var statusMessage by mutableStateOf("Scan an NFC tag to load text records.")
+    private var statusMessage by mutableStateOf("Scan an NFC tag to load editable records.")
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -61,23 +70,34 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     NfcEditorScreen(
                         statusMessage = statusMessage,
-                        records = editableTextRecords.map { it.text },
+                        records = editableRecords,
+                        newRecordType = newRecordType,
                         newRecordValue = newRecordValue,
                         onRecordChange = { index, value ->
-                            editableTextRecords = editableTextRecords.toMutableList().also {
-                                it[index] = it[index].copy(text = value)
+                            editableRecords = editableRecords.toMutableList().also {
+                                it[index] = it[index].copy(value = value)
                             }
                         },
                         onRemoveRecord = { index ->
-                            editableTextRecords = editableTextRecords.toMutableList().also { it.removeAt(index) }
+                            editableRecords = editableRecords.toMutableList().also { it.removeAt(index) }
                         },
+                        onNewRecordTypeChange = { newRecordType = it },
                         onNewRecordChange = { newRecordValue = it },
                         onAddRecord = {
-                            editableTextRecords = editableTextRecords +
-                                NdefTextCodec.EditableTextRecord(originalRecordIndex = null, text = newRecordValue)
-                            newRecordValue = ""
+                            if (newRecordValue.isBlank()) {
+                                statusMessage = "${newRecordType.displayName} value cannot be blank."
+                            } else {
+                                editableRecords = editableRecords +
+                                    NdefTextCodec.EditableRecord(
+                                        originalRecordIndex = null,
+                                        type = newRecordType,
+                                        value = newRecordValue
+                                    )
+                                newRecordValue = ""
+                            }
                         },
                         onWrite = { armWrite() },
+                        canAddRecord = newRecordValue.isNotBlank(),
                         isWriteArmed = writeState != WriteState.IDLE,
                         modifier = Modifier.padding(innerPadding)
                     )
@@ -125,7 +145,7 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
             runOnUiThread {
                 currentTag = tag
                 originalMessage = null
-                editableTextRecords = emptyList()
+                editableRecords = emptyList()
                 statusMessage = "NDEF unavailable. Detected technologies: $techSummary"
             }
             return
@@ -134,28 +154,37 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
         try {
             ndef.connect()
             val message = ndef.cachedNdefMessage ?: ndef.ndefMessage
-            val parsedRecords = NdefTextCodec.editableTextRecordsFromMessage(message)
+            val parsedRecords = NdefTextCodec.editableRecordsFromMessage(message)
             val shouldWriteNow = writeState == WriteState.WAITING_NEXT_SCAN
-            val recordsSnapshot = editableTextRecords
-            val writeMessage = if (shouldWriteNow) buildMessageForWrite(message, recordsSnapshot) else null
-            if (shouldWriteNow && writeMessage == null) {
+            val recordsSnapshot = editableRecords
+            val writePreparation = if (shouldWriteNow) {
+                buildMessageForWrite(message, recordsSnapshot)
+            } else {
+                null
+            }
+            if (shouldWriteNow && writePreparation != null && writePreparation !is WriteMessagePreparation.Ready) {
                 runOnUiThread {
                     writeState = WriteState.IDLE
                     armedTagId = null
-                    statusMessage = "Cannot write empty NDEF message."
+                    statusMessage = when (writePreparation) {
+                        WriteMessagePreparation.Empty -> "Cannot write empty NDEF message."
+                        is WriteMessagePreparation.Invalid -> writePreparation.reason
+                        is WriteMessagePreparation.Ready -> "Preparing write."
+                    }
                 }
                 return
             }
+            val writeMessage = (writePreparation as? WriteMessagePreparation.Ready)?.message
             runOnUiThread {
                 currentTag = tag
                 originalMessage = message
-                editableTextRecords = parsedRecords
+                editableRecords = parsedRecords
                 statusMessage = if (shouldWriteNow) {
                     "Writing to tag..."
                 } else if (parsedRecords.isEmpty()) {
-                    "NDEF tag loaded. No text records found. Tech: $techSummary"
+                    "NDEF tag loaded. No editable records found. Tech: $techSummary"
                 } else {
-                    "NDEF tag loaded: ${parsedRecords.size} text record(s). Tech: $techSummary"
+                    "NDEF tag loaded: ${parsedRecords.size} editable record(s). Tech: $techSummary"
                 }
             }
             if (shouldWriteNow) {
@@ -177,10 +206,10 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
                     return
                 }
                 ndef.writeNdefMessage(writeMessage)
-                val updatedRecords = NdefTextCodec.editableTextRecordsFromMessage(writeMessage)
+                val updatedRecords = NdefTextCodec.editableRecordsFromMessage(writeMessage)
                 runOnUiThread {
                     originalMessage = writeMessage
-                    editableTextRecords = updatedRecords
+                    editableRecords = updatedRecords
                     writeState = WriteState.IDLE
                     armedTagId = null
                     statusMessage = "Tag written successfully."
@@ -208,8 +237,8 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
             return
         }
 
-        if (editableTextRecords.isEmpty()) {
-            statusMessage = "No editable text records to write."
+        if (editableRecords.isEmpty()) {
+            statusMessage = "No editable records to write."
             return
         }
 
@@ -248,21 +277,24 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
 
     private fun buildMessageForWrite(
         baseMessage: NdefMessage?,
-        recordsToWrite: List<NdefTextCodec.EditableTextRecord>
-    ): NdefMessage? {
+        recordsToWrite: List<NdefTextCodec.EditableRecord>
+    ): WriteMessagePreparation {
+        val trimmedRecords = NdefTextCodec.trimForSave(recordsToWrite)
+        if (trimmedRecords.isEmpty()) {
+            return WriteMessagePreparation.Empty
+        }
+
         return try {
-            if (baseMessage != null) {
-                NdefTextCodec.patchMessage(baseMessage, recordsToWrite)
+            val message = if (baseMessage != null) {
+                NdefTextCodec.patchMessage(baseMessage, trimmedRecords)
             } else {
-                val trimmedRecords = NdefTextCodec.trimForSave(recordsToWrite.map { it.text })
-                if (trimmedRecords.isEmpty()) {
-                    null
-                } else {
-                    NdefTextCodec.buildTextMessage(trimmedRecords)
-                }
+                NdefTextCodec.buildMessage(trimmedRecords)
             }
-        } catch (_: IllegalArgumentException) {
-            null
+            WriteMessagePreparation.Ready(message)
+        } catch (illegalArgumentException: IllegalArgumentException) {
+            WriteMessagePreparation.Invalid(
+                illegalArgumentException.message ?: "Record data is invalid."
+            )
         }
     }
 }
@@ -270,13 +302,16 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
 @Composable
 fun NfcEditorScreen(
     statusMessage: String,
-    records: List<String>,
+    records: List<NdefTextCodec.EditableRecord>,
+    newRecordType: NdefTextCodec.EditableRecordType,
     newRecordValue: String,
     onRecordChange: (Int, String) -> Unit,
     onRemoveRecord: (Int) -> Unit,
+    onNewRecordTypeChange: (NdefTextCodec.EditableRecordType) -> Unit,
     onNewRecordChange: (String) -> Unit,
     onAddRecord: () -> Unit,
     onWrite: () -> Unit,
+    canAddRecord: Boolean,
     isWriteArmed: Boolean,
     modifier: Modifier = Modifier
 ) {
@@ -289,12 +324,13 @@ fun NfcEditorScreen(
     ) {
         Text(text = statusMessage)
 
-        records.forEachIndexed { index, value ->
+        records.forEachIndexed { index, record ->
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                 OutlinedTextField(
-                    value = value,
+                    value = record.value,
                     onValueChange = { onRecordChange(index, it) },
-                    label = { Text("Text record ${index + 1}") },
+                    label = { Text("${record.type.displayName} record ${index + 1}") },
+                    keyboardOptions = KeyboardOptions(keyboardType = record.type.keyboardType),
                     modifier = Modifier.weight(1f)
                 )
                 OutlinedButton(onClick = { onRemoveRecord(index) }) {
@@ -303,15 +339,21 @@ fun NfcEditorScreen(
             }
         }
 
+        Text("Add new record")
+        RecordTypePicker(
+            selectedType = newRecordType,
+            onTypeSelected = onNewRecordTypeChange
+        )
         OutlinedTextField(
             value = newRecordValue,
             onValueChange = onNewRecordChange,
-            label = { Text("New text record") },
+            label = { Text(newRecordType.newRecordLabel) },
+            keyboardOptions = KeyboardOptions(keyboardType = newRecordType.keyboardType),
             modifier = Modifier.fillMaxWidth()
         )
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = onAddRecord) {
-                Text("Add record")
+            OutlinedButton(onClick = onAddRecord, enabled = canAddRecord) {
+                Text("Add ${newRecordType.displayName.lowercase()} record")
             }
             Button(onClick = onWrite) {
                 Text(if (isWriteArmed) "Write armed" else "Write tag")
@@ -320,19 +362,70 @@ fun NfcEditorScreen(
     }
 }
 
+@Composable
+private fun RecordTypePicker(
+    selectedType: NdefTextCodec.EditableRecordType,
+    onTypeSelected: (NdefTextCodec.EditableRecordType) -> Unit
+) {
+    NdefTextCodec.EditableRecordType.values().toList().chunked(2).forEach { rowTypes ->
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            rowTypes.forEach { type ->
+                val buttonModifier = Modifier.weight(1f)
+                if (type == selectedType) {
+                    Button(onClick = { onTypeSelected(type) }, modifier = buttonModifier) {
+                        Text(type.displayName)
+                    }
+                } else {
+                    OutlinedButton(onClick = { onTypeSelected(type) }, modifier = buttonModifier) {
+                        Text(type.displayName)
+                    }
+                }
+            }
+            if (rowTypes.size == 1) {
+                Column(modifier = Modifier.weight(1f)) {}
+            }
+        }
+    }
+}
+
+private val NdefTextCodec.EditableRecordType.keyboardType: KeyboardType
+    get() = when (this) {
+        NdefTextCodec.EditableRecordType.TEXT -> KeyboardType.Text
+        NdefTextCodec.EditableRecordType.LINK -> KeyboardType.Uri
+        NdefTextCodec.EditableRecordType.PHONE -> KeyboardType.Phone
+        NdefTextCodec.EditableRecordType.EMAIL -> KeyboardType.Email
+    }
+
 @Preview(showBackground = true)
 @Composable
 fun GreetingPreview() {
     NfcDroidTheme {
         NfcEditorScreen(
-            statusMessage = "Scan an NFC tag to load text records.",
-            records = listOf("Record A", "Record B"),
+            statusMessage = "Scan an NFC tag to load editable records.",
+            records = listOf(
+                NdefTextCodec.EditableRecord(
+                    originalRecordIndex = 0,
+                    type = NdefTextCodec.EditableRecordType.TEXT,
+                    value = "Record A"
+                ),
+                NdefTextCodec.EditableRecord(
+                    originalRecordIndex = 1,
+                    type = NdefTextCodec.EditableRecordType.LINK,
+                    value = "https://example.com"
+                )
+            ),
+            newRecordType = NdefTextCodec.EditableRecordType.TEXT,
             newRecordValue = "",
             onRecordChange = { _, _ -> },
             onRemoveRecord = {},
+            onNewRecordTypeChange = {},
             onNewRecordChange = {},
             onAddRecord = {},
             onWrite = {},
+            canAddRecord = false,
             isWriteArmed = false
         )
     }
