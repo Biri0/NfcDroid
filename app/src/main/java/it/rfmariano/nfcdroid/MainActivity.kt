@@ -1,11 +1,16 @@
 package it.rfmariano.nfcdroid
 
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.nfc.FormatException
 import android.nfc.NdefMessage
 import android.nfc.NfcAdapter
 import android.nfc.Tag
 import android.nfc.tech.Ndef
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -18,11 +23,13 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -31,6 +38,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.DialogProperties
 import it.rfmariano.nfcdroid.ui.theme.NfcDroidTheme
 import java.io.IOException
 
@@ -42,6 +50,10 @@ enum class PendingAction {
 }
 
 class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
+    companion object {
+        private const val NFC_DISABLED_MESSAGE = "NFC is disabled. Enable it to continue using the app."
+    }
+
     private sealed interface WriteMessagePreparation {
         data class Ready(val message: NdefMessage) : WriteMessagePreparation
         data object Empty : WriteMessagePreparation
@@ -58,6 +70,16 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
     private var pendingAction by mutableStateOf(PendingAction.NONE)
     private var tagSecurityInfo by mutableStateOf<Ntag215Manager.TagSecurityInfo?>(null)
     private var statusMessage by mutableStateOf("Scan an NFC tag to load editable records.")
+    private var showNfcDisabledDialog by mutableStateOf(false)
+    private var isNfcStateReceiverRegistered = false
+    private var isActivityResumed = false
+    private val nfcStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == NfcAdapter.ACTION_ADAPTER_STATE_CHANGED) {
+                handleNfcAvailabilityChange()
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -65,6 +87,8 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
         nfcAdapter = NfcAdapter.getDefaultAdapter(this)
         if (nfcAdapter == null) {
             statusMessage = "NFC is not available on this device."
+        } else {
+            handleNfcAvailabilityChange()
         }
         setContent {
             NfcDroidTheme {
@@ -77,6 +101,7 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
                         passwordInput = passwordInput,
                         securityInfo = tagSecurityInfo,
                         pendingAction = pendingAction,
+                        showNfcDisabledDialog = showNfcDisabledDialog,
                         onRecordChange = { index, value ->
                             editableRecords = editableRecords.toMutableList().also {
                                 it[index] = it[index].copy(value = value)
@@ -104,6 +129,7 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
                         onWrite = { armAction(PendingAction.WRITE) },
                         onProtect = { armAction(PendingAction.PROTECT) },
                         onUnprotect = { armAction(PendingAction.UNPROTECT) },
+                        onOpenNfcSettings = ::openNfcSettings,
                         canAddRecord = newRecordValue.isNotBlank(),
                         modifier = Modifier.padding(innerPadding)
                     )
@@ -112,23 +138,26 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        registerNfcStateReceiver()
+    }
+
     override fun onResume() {
         super.onResume()
-        val adapter = nfcAdapter ?: return
-        adapter.enableReaderMode(
-            this,
-            this,
-            NfcAdapter.FLAG_READER_NFC_A or
-                NfcAdapter.FLAG_READER_NFC_B or
-                NfcAdapter.FLAG_READER_NFC_F or
-                NfcAdapter.FLAG_READER_NFC_V,
-            null
-        )
+        isActivityResumed = true
+        handleNfcAvailabilityChange()
     }
 
     override fun onPause() {
+        isActivityResumed = false
         nfcAdapter?.disableReaderMode(this)
         super.onPause()
+    }
+
+    override fun onStop() {
+        unregisterNfcStateReceiver()
+        super.onStop()
     }
 
     override fun onTagDiscovered(tag: Tag) {
@@ -147,6 +176,10 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
     }
 
     private fun armAction(action: PendingAction) {
+        if (showNfcDisabledDialog) {
+            statusMessage = NFC_DISABLED_MESSAGE
+            return
+        }
         if (action == PendingAction.WRITE && editableRecords.isEmpty()) {
             statusMessage = "No editable records to write."
             return
@@ -159,6 +192,70 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
             PendingAction.PROTECT -> "Protection armed. Tap an NTAG215 to set the password."
             PendingAction.UNPROTECT -> "Remove-password armed. Tap an NTAG215 and enter its password."
         }
+    }
+
+    private fun handleNfcAvailabilityChange() {
+        val adapter = nfcAdapter ?: return
+        if (adapter.isEnabled) {
+            val wasBlocked = showNfcDisabledDialog
+            showNfcDisabledDialog = false
+            if (wasBlocked) {
+                statusMessage = "NFC enabled. Scan an NFC tag to continue."
+            }
+            enableReaderModeIfAvailable()
+            return
+        }
+
+        showNfcDisabledDialog = true
+        pendingAction = PendingAction.NONE
+        currentTag = null
+        adapter.disableReaderMode(this)
+        statusMessage = NFC_DISABLED_MESSAGE
+    }
+
+    private fun enableReaderModeIfAvailable() {
+        val adapter = nfcAdapter ?: return
+        if (!isActivityResumed || !adapter.isEnabled) {
+            return
+        }
+        adapter.enableReaderMode(
+            this,
+            this,
+            NfcAdapter.FLAG_READER_NFC_A or
+                NfcAdapter.FLAG_READER_NFC_B or
+                NfcAdapter.FLAG_READER_NFC_F or
+                NfcAdapter.FLAG_READER_NFC_V,
+            null
+        )
+    }
+
+    private fun registerNfcStateReceiver() {
+        if (nfcAdapter == null || isNfcStateReceiverRegistered) {
+            return
+        }
+        registerReceiver(
+            nfcStateReceiver,
+            IntentFilter(NfcAdapter.ACTION_ADAPTER_STATE_CHANGED),
+            Context.RECEIVER_NOT_EXPORTED
+        )
+        isNfcStateReceiverRegistered = true
+    }
+
+    private fun unregisterNfcStateReceiver() {
+        if (!isNfcStateReceiverRegistered) {
+            return
+        }
+        unregisterReceiver(nfcStateReceiver)
+        isNfcStateReceiverRegistered = false
+    }
+
+    private fun openNfcSettings() {
+        val settingsIntent = listOf(
+            Intent(Settings.Panel.ACTION_NFC),
+            Intent(Settings.ACTION_NFC_SETTINGS),
+            Intent(Settings.ACTION_WIRELESS_SETTINGS)
+        ).firstOrNull { intent -> intent.resolveActivity(packageManager) != null } ?: return
+        startActivity(settingsIntent)
     }
 
     private fun performPendingAction(
@@ -376,6 +473,7 @@ fun NfcEditorScreen(
     passwordInput: String,
     securityInfo: Ntag215Manager.TagSecurityInfo?,
     pendingAction: PendingAction,
+    showNfcDisabledDialog: Boolean,
     onRecordChange: (Int, String) -> Unit,
     onRemoveRecord: (Int) -> Unit,
     onNewRecordTypeChange: (NdefTextCodec.EditableRecordType) -> Unit,
@@ -385,9 +483,27 @@ fun NfcEditorScreen(
     onWrite: () -> Unit,
     onProtect: () -> Unit,
     onUnprotect: () -> Unit,
+    onOpenNfcSettings: () -> Unit,
     canAddRecord: Boolean,
     modifier: Modifier = Modifier
 ) {
+    if (showNfcDisabledDialog) {
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text("Enable NFC") },
+            text = { Text("NFC is required to use this app. Turn it back on to continue.") },
+            confirmButton = {
+                TextButton(onClick = onOpenNfcSettings) {
+                    Text("Open NFC settings")
+                }
+            },
+            properties = DialogProperties(
+                dismissOnBackPress = false,
+                dismissOnClickOutside = false
+            )
+        )
+    }
+
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -528,6 +644,7 @@ fun GreetingPreview() {
                 pack = byteArrayOf(0x00, 0x00)
             ),
             pendingAction = PendingAction.NONE,
+            showNfcDisabledDialog = false,
             onRecordChange = { _, _ -> },
             onRemoveRecord = {},
             onNewRecordTypeChange = {},
@@ -537,6 +654,7 @@ fun GreetingPreview() {
             onWrite = {},
             onProtect = {},
             onUnprotect = {},
+            onOpenNfcSettings = {},
             canAddRecord = false
         )
     }
