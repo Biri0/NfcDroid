@@ -14,39 +14,65 @@ import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.DialogProperties
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import it.rfmariano.nfcdroid.ui.theme.NfcDroidTheme
 import java.io.IOException
+import kotlinx.coroutines.launch
 
 enum class PendingAction {
     NONE,
     WRITE,
     PROTECT,
     UNPROTECT
+}
+
+private enum class EditorStep {
+    SCAN,
+    EDIT,
+    WRITE
 }
 
 class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
@@ -68,6 +94,7 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
     private var newRecordValue by mutableStateOf("")
     private var passwordInput by mutableStateOf("")
     private var pendingAction by mutableStateOf(PendingAction.NONE)
+    private var currentStep by mutableStateOf(EditorStep.SCAN)
     private var tagSecurityInfo by mutableStateOf<Ntag215Manager.TagSecurityInfo?>(null)
     private var statusMessage by mutableStateOf("Scan an NFC tag to load editable records.")
     private var showNfcDisabledDialog by mutableStateOf(false)
@@ -101,6 +128,7 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
                         passwordInput = passwordInput,
                         securityInfo = tagSecurityInfo,
                         pendingAction = pendingAction,
+                        currentStep = currentStep,
                         showNfcDisabledDialog = showNfcDisabledDialog,
                         onRecordChange = { index, value ->
                             editableRecords = editableRecords.toMutableList().also {
@@ -129,6 +157,7 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
                         onWrite = { armAction(PendingAction.WRITE) },
                         onProtect = { armAction(PendingAction.PROTECT) },
                         onUnprotect = { armAction(PendingAction.UNPROTECT) },
+                        onStepChange = ::updateCurrentStep,
                         onOpenNfcSettings = ::openNfcSettings,
                         canAddRecord = newRecordValue.isNotBlank(),
                         modifier = Modifier.padding(innerPadding)
@@ -170,8 +199,12 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
 
         if (pendingAction != PendingAction.NONE) {
             performPendingAction(tag, techSummary, security)
-        } else {
+        } else if (currentStep == EditorStep.SCAN) {
             loadTag(tag, techSummary, security)
+        } else {
+            runOnUiThread {
+                statusMessage = "Open the Scan step to read a tag."
+            }
         }
     }
 
@@ -186,6 +219,7 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
         }
         pendingAction = action
         currentTag = null
+        syncReaderMode()
         statusMessage = when (action) {
             PendingAction.NONE -> "Scan an NFC tag to load editable records."
             PendingAction.WRITE -> "Write armed. Tap tag to write."
@@ -202,7 +236,7 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
             if (wasBlocked) {
                 statusMessage = "NFC enabled. Scan an NFC tag to continue."
             }
-            enableReaderModeIfAvailable()
+            syncReaderMode()
             return
         }
 
@@ -213,9 +247,14 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
         statusMessage = NFC_DISABLED_MESSAGE
     }
 
-    private fun enableReaderModeIfAvailable() {
+    private fun syncReaderMode() {
         val adapter = nfcAdapter ?: return
         if (!isActivityResumed || !adapter.isEnabled) {
+            adapter.disableReaderMode(this)
+            return
+        }
+        if (pendingAction == PendingAction.NONE && currentStep != EditorStep.SCAN) {
+            adapter.disableReaderMode(this)
             return
         }
         adapter.enableReaderMode(
@@ -227,6 +266,12 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
                 NfcAdapter.FLAG_READER_NFC_V,
             null
         )
+    }
+
+    private fun updateCurrentStep(step: EditorStep) {
+        if (currentStep == step) return
+        currentStep = step
+        syncReaderMode()
     }
 
     private fun registerNfcStateReceiver() {
@@ -273,6 +318,7 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
         } catch (exception: Exception) {
             runOnUiThread {
                 pendingAction = PendingAction.NONE
+                syncReaderMode()
                 statusMessage = exception.message ?: "Tag operation failed."
             }
         }
@@ -283,6 +329,7 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
         if (writePreparation !is WriteMessagePreparation.Ready) {
             runOnUiThread {
                 pendingAction = PendingAction.NONE
+                syncReaderMode()
                 statusMessage = when (writePreparation) {
                     WriteMessagePreparation.Empty -> "Cannot write empty NDEF message."
                     is WriteMessagePreparation.Invalid -> writePreparation.reason
@@ -297,6 +344,7 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
             if (passwordInput.isBlank()) {
                 runOnUiThread {
                     pendingAction = PendingAction.NONE
+                    syncReaderMode()
                     statusMessage = "This tag is password protected. Enter the password, then tap again."
                 }
                 return
@@ -308,6 +356,7 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
                 currentTag = tag
                 tagSecurityInfo = updatedSecurity
                 pendingAction = PendingAction.NONE
+                syncReaderMode()
                 statusMessage = "Protected NTAG215 written successfully."
             }
             return
@@ -317,6 +366,7 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
         if (ndef == null) {
             runOnUiThread {
                 pendingAction = PendingAction.NONE
+                syncReaderMode()
                 statusMessage = "NDEF unavailable. Detected technologies: $techSummary"
             }
             return
@@ -327,6 +377,7 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
             if (!ndef.isWritable) {
                 runOnUiThread {
                     pendingAction = PendingAction.NONE
+                    syncReaderMode()
                     statusMessage = "Tag is read-only."
                 }
                 return
@@ -334,6 +385,7 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
             if (writeMessage.toByteArray().size > ndef.maxSize) {
                 runOnUiThread {
                     pendingAction = PendingAction.NONE
+                    syncReaderMode()
                     statusMessage = "NDEF message too large for this tag."
                 }
                 return
@@ -345,6 +397,7 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
                 currentTag = tag
                 tagSecurityInfo = security
                 pendingAction = PendingAction.NONE
+                syncReaderMode()
                 statusMessage = "Tag written successfully."
             }
         } finally {
@@ -361,6 +414,7 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
             currentTag = tag
             tagSecurityInfo = updatedSecurity
             pendingAction = PendingAction.NONE
+            syncReaderMode()
             statusMessage = "NTAG215 password set. Reads stay open, writes now require the password. Tech: $techSummary"
         }
     }
@@ -371,6 +425,7 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
             currentTag = tag
             tagSecurityInfo = updatedSecurity
             pendingAction = PendingAction.NONE
+            syncReaderMode()
             statusMessage = "NTAG215 password removed. Tag is writable again. Tech: $techSummary"
         }
     }
@@ -465,7 +520,7 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
 }
 
 @Composable
-fun NfcEditorScreen(
+private fun NfcEditorScreen(
     statusMessage: String,
     records: List<NdefTextCodec.EditableRecord>,
     newRecordType: NdefTextCodec.EditableRecordType,
@@ -473,6 +528,7 @@ fun NfcEditorScreen(
     passwordInput: String,
     securityInfo: Ntag215Manager.TagSecurityInfo?,
     pendingAction: PendingAction,
+    currentStep: EditorStep,
     showNfcDisabledDialog: Boolean,
     onRecordChange: (Int, String) -> Unit,
     onRemoveRecord: (Int) -> Unit,
@@ -483,6 +539,7 @@ fun NfcEditorScreen(
     onWrite: () -> Unit,
     onProtect: () -> Unit,
     onUnprotect: () -> Unit,
+    onStepChange: (EditorStep) -> Unit,
     onOpenNfcSettings: () -> Unit,
     canAddRecord: Boolean,
     modifier: Modifier = Modifier
@@ -504,66 +561,107 @@ fun NfcEditorScreen(
         )
     }
 
-    Column(
+    val steps = remember { EditorStep.entries }
+    val pagerState = rememberPagerState(pageCount = { steps.size })
+    val coroutineScope = rememberCoroutineScope()
+
+    fun animateToStep(step: EditorStep) {
+        onStepChange(step)
+        coroutineScope.launch { pagerState.animateScrollToPage(step.ordinal) }
+    }
+
+    LaunchedEffect(currentStep) {
+        val targetPage = currentStep.ordinal
+        if (pagerState.currentPage != targetPage) {
+            pagerState.animateScrollToPage(targetPage)
+        }
+    }
+
+    LaunchedEffect(pagerState.currentPage) {
+        val visibleStep = steps[pagerState.currentPage]
+        if (visibleStep != currentStep) {
+            onStepChange(visibleStep)
+        }
+    }
+
+    Box(
         modifier = modifier
             .fillMaxSize()
-            .padding(16.dp)
-            .verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        Text(text = statusMessage)
-        Text(text = securityInfo.describe())
-
-        OutlinedTextField(
-            value = passwordInput,
-            onValueChange = onPasswordChange,
-            label = { Text("NTAG215 password (4 chars or 8 hex)") },
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-            modifier = Modifier.fillMaxWidth()
-        )
-
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-            Button(onClick = onWrite, modifier = Modifier.weight(1f)) {
-                Text(if (pendingAction == PendingAction.WRITE) "Tap tag to write" else "Write tag")
-            }
-            OutlinedButton(onClick = onProtect, modifier = Modifier.weight(1f)) {
-                Text(if (pendingAction == PendingAction.PROTECT) "Tap to protect" else "Protect tag")
-            }
-        }
-
-        OutlinedButton(onClick = onUnprotect, modifier = Modifier.fillMaxWidth()) {
-            Text(if (pendingAction == PendingAction.UNPROTECT) "Tap to remove password" else "Remove password")
-        }
-
-        records.forEachIndexed { index, record ->
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                OutlinedTextField(
-                    value = record.value,
-                    onValueChange = { onRecordChange(index, it) },
-                    label = { Text("${record.type.displayName} record ${index + 1}") },
-                    keyboardOptions = KeyboardOptions(keyboardType = record.type.keyboardType),
-                    modifier = Modifier.weight(1f)
+            .background(
+                brush = Brush.verticalGradient(
+                    colors = listOf(
+                        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f),
+                        MaterialTheme.colorScheme.background,
+                        MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.18f)
+                    )
                 )
-                OutlinedButton(onClick = { onRemoveRecord(index) }) {
-                    Text("Remove")
-                }
+            )
+    ) {
+        HorizontalPager(
+            state = pagerState,
+            modifier = Modifier.fillMaxSize(),
+            userScrollEnabled = true
+        ) { page ->
+            when (steps[page]) {
+                EditorStep.SCAN -> ScanPage(
+                    currentStep = page,
+                    statusMessage = statusMessage,
+                    showNfcDisabledDialog = showNfcDisabledDialog,
+                    records = records,
+                    securityInfo = securityInfo,
+                    onOpenNfcSettings = onOpenNfcSettings,
+                    onStepSelected = { target ->
+                        val step = steps[target]
+                        if (step != currentStep) {
+                            animateToStep(step)
+                        }
+                    },
+                    onNext = { animateToStep(EditorStep.EDIT) }
+                )
+                EditorStep.EDIT -> EditPage(
+                    currentStep = page,
+                    statusMessage = statusMessage,
+                    showNfcDisabledDialog = showNfcDisabledDialog,
+                    records = records,
+                    newRecordType = newRecordType,
+                    newRecordValue = newRecordValue,
+                    securityInfo = securityInfo,
+                    onRecordChange = onRecordChange,
+                    onRemoveRecord = onRemoveRecord,
+                    onNewRecordTypeChange = onNewRecordTypeChange,
+                    onNewRecordChange = onNewRecordChange,
+                    onAddRecord = onAddRecord,
+                    canAddRecord = canAddRecord,
+                    onStepSelected = { target ->
+                        val step = steps[target]
+                        if (step != currentStep) {
+                            animateToStep(step)
+                        }
+                    },
+                    onBack = { animateToStep(EditorStep.SCAN) },
+                    onNext = { animateToStep(EditorStep.WRITE) }
+                )
+                EditorStep.WRITE -> WritePage(
+                    currentStep = page,
+                    statusMessage = statusMessage,
+                    showNfcDisabledDialog = showNfcDisabledDialog,
+                    records = records,
+                    passwordInput = passwordInput,
+                    securityInfo = securityInfo,
+                    pendingAction = pendingAction,
+                    onPasswordChange = onPasswordChange,
+                    onWrite = onWrite,
+                    onProtect = onProtect,
+                    onUnprotect = onUnprotect,
+                    onStepSelected = { target ->
+                        val step = steps[target]
+                        if (step != currentStep) {
+                            animateToStep(step)
+                        }
+                    },
+                    onBack = { animateToStep(EditorStep.EDIT) }
+                )
             }
-        }
-
-        Text("Add new record")
-        RecordTypePicker(
-            selectedType = newRecordType,
-            onTypeSelected = onNewRecordTypeChange
-        )
-        OutlinedTextField(
-            value = newRecordValue,
-            onValueChange = onNewRecordChange,
-            label = { Text(newRecordType.newRecordLabel) },
-            keyboardOptions = KeyboardOptions(keyboardType = newRecordType.keyboardType),
-            modifier = Modifier.fillMaxWidth()
-        )
-        OutlinedButton(onClick = onAddRecord, enabled = canAddRecord) {
-            Text("Add ${newRecordType.displayName.lowercase()} record")
         }
     }
 }
@@ -572,9 +670,496 @@ private fun Ntag215Manager.TagSecurityInfo?.describe(): String {
     if (this == null) return "No NTAG215 security info for the current tag yet."
     if (!isNtag215) return "Current tag is not an NTAG215."
     return if (isWriteProtected) {
-        "NTAG215 status: password enabled for writes from page $auth0Page."
+        "Password required for writes from page $auth0Page."
     } else {
-        "NTAG215 status: no password configured."
+        "No password configured yet."
+    }
+}
+
+@Composable
+private fun StateBanner(
+    pendingAction: PendingAction,
+    showNfcDisabledDialog: Boolean,
+    statusMessage: String
+) {
+    val tone = when {
+        showNfcDisabledDialog -> MaterialTheme.colorScheme.tertiaryContainer
+        pendingAction == PendingAction.NONE -> MaterialTheme.colorScheme.primaryContainer
+        else -> MaterialTheme.colorScheme.secondaryContainer
+    }
+    val title = when {
+        showNfcDisabledDialog -> "NFC is off"
+        pendingAction == PendingAction.WRITE -> "Ready to write"
+        pendingAction == PendingAction.PROTECT -> "Ready to protect"
+        pendingAction == PendingAction.UNPROTECT -> "Ready to remove password"
+        else -> "Waiting for a tag"
+    }
+    Surface(
+        shape = RoundedCornerShape(24.dp),
+        color = tone
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Text(text = title, style = MaterialTheme.typography.titleLarge)
+            Text(text = statusMessage, style = MaterialTheme.typography.bodyMedium)
+        }
+    }
+}
+
+@Composable
+private fun StepperHeader(
+    currentStep: Int,
+    onStepSelected: (Int) -> Unit
+) {
+    val labels = listOf("Scan", "Edit", "Write")
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        labels.forEachIndexed { index, label ->
+            val selected = index == currentStep
+            Surface(
+                onClick = { onStepSelected(index) },
+                shape = RoundedCornerShape(20.dp),
+                color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface,
+                contentColor = if (selected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface,
+                tonalElevation = if (selected) 3.dp else 0.dp,
+                modifier = Modifier.weight(1f)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    Surface(
+                        shape = CircleShape,
+                        color = if (selected) MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.18f) else MaterialTheme.colorScheme.primaryContainer
+                    ) {
+                        Text(
+                            text = "${index + 1}",
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                            style = MaterialTheme.typography.labelLarge
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(text = label, style = MaterialTheme.typography.titleMedium)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ScanPage(
+    currentStep: Int,
+    statusMessage: String,
+    showNfcDisabledDialog: Boolean,
+    records: List<NdefTextCodec.EditableRecord>,
+    securityInfo: Ntag215Manager.TagSecurityInfo?,
+    onOpenNfcSettings: () -> Unit,
+    onStepSelected: (Int) -> Unit,
+    onNext: () -> Unit
+) {
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        item {
+            CompactTopBlock(
+                currentStep = currentStep,
+                pendingAction = PendingAction.NONE,
+                showNfcDisabledDialog = showNfcDisabledDialog,
+                statusMessage = statusMessage,
+                title = "Scan a tag",
+                description = "Bring an NFC tag close to your device to inspect what is already stored on it.",
+                onStepSelected = onStepSelected
+            )
+        }
+        item {
+            Surface(
+                shape = RoundedCornerShape(28.dp),
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.9f),
+                tonalElevation = 2.dp,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(22.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        text = if (showNfcDisabledDialog) "NFC disabled" else "Scanner listening",
+                        style = MaterialTheme.typography.headlineMedium
+                    )
+                    Text(
+                        text = if (showNfcDisabledDialog) {
+                            "Turn NFC back on, then return here."
+                        } else {
+                            "Hold the phone near a tag. The app will load records automatically."
+                        },
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    FilledTonalButton(onClick = onOpenNfcSettings) {
+                        Text("Open NFC settings")
+                    }
+                }
+            }
+        }
+        item { SummaryTile(label = "Status", value = statusMessage) }
+        item { SummaryTile(label = "Editable records", value = if (records.isEmpty()) "None loaded" else "${records.size} loaded") }
+        item { SummaryTile(label = "Security", value = securityInfo.describe()) }
+        item { InlinePagerNavBar(currentStep = currentStep, onNext = onNext) }
+    }
+}
+
+@Composable
+private fun EditPage(
+    currentStep: Int,
+    statusMessage: String,
+    showNfcDisabledDialog: Boolean,
+    records: List<NdefTextCodec.EditableRecord>,
+    newRecordType: NdefTextCodec.EditableRecordType,
+    newRecordValue: String,
+    securityInfo: Ntag215Manager.TagSecurityInfo?,
+    onRecordChange: (Int, String) -> Unit,
+    onRemoveRecord: (Int) -> Unit,
+    onNewRecordTypeChange: (NdefTextCodec.EditableRecordType) -> Unit,
+    onNewRecordChange: (String) -> Unit,
+    onAddRecord: () -> Unit,
+    canAddRecord: Boolean,
+    onStepSelected: (Int) -> Unit,
+    onBack: () -> Unit,
+    onNext: () -> Unit
+) {
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        item {
+            CompactTopBlock(
+                currentStep = currentStep,
+                pendingAction = PendingAction.NONE,
+                showNfcDisabledDialog = showNfcDisabledDialog,
+                statusMessage = statusMessage,
+                title = "Edit content",
+                description = "Review the records already on the tag, adjust them, or add new ones before writing.",
+                onStepSelected = onStepSelected
+            )
+        }
+        item { SummaryTile(label = "Security", value = securityInfo.describe()) }
+        if (records.isEmpty()) {
+            item {
+                EmptyStateCard(
+                    title = "No editable records yet",
+                    message = "Scan a tag to load existing content, or create a new record below."
+                )
+            }
+        }
+        itemsIndexed(records) { index, record ->
+            RecordEditorCard(
+                index = index,
+                record = record,
+                onRecordChange = onRecordChange,
+                onRemoveRecord = onRemoveRecord
+            )
+        }
+        item {
+            AddRecordCard(
+                newRecordType = newRecordType,
+                newRecordValue = newRecordValue,
+                onNewRecordTypeChange = onNewRecordTypeChange,
+                onNewRecordChange = onNewRecordChange,
+                onAddRecord = onAddRecord,
+                canAddRecord = canAddRecord
+            )
+        }
+        item { InlinePagerNavBar(currentStep = currentStep, onBack = onBack, onNext = onNext) }
+    }
+}
+
+@Composable
+private fun WritePage(
+    currentStep: Int,
+    statusMessage: String,
+    showNfcDisabledDialog: Boolean,
+    records: List<NdefTextCodec.EditableRecord>,
+    passwordInput: String,
+    securityInfo: Ntag215Manager.TagSecurityInfo?,
+    pendingAction: PendingAction,
+    onPasswordChange: (String) -> Unit,
+    onWrite: () -> Unit,
+    onProtect: () -> Unit,
+    onUnprotect: () -> Unit,
+    onStepSelected: (Int) -> Unit,
+    onBack: () -> Unit
+) {
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        item {
+            CompactTopBlock(
+                currentStep = currentStep,
+                pendingAction = pendingAction,
+                showNfcDisabledDialog = showNfcDisabledDialog,
+                statusMessage = statusMessage,
+                title = "Write and secure",
+                description = "Arm the next action, then tap the destination tag to write or manage protection.",
+                onStepSelected = onStepSelected
+            )
+        }
+        item {
+            SummaryTile(label = "Records ready", value = if (records.isEmpty()) "Nothing to write yet" else "${records.size} record(s) prepared")
+        }
+        item {
+            Button(
+                onClick = onWrite,
+                enabled = records.isNotEmpty(),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(if (pendingAction == PendingAction.WRITE) "Tap tag to write" else "Write records")
+            }
+        }
+        item {
+            SecurityToolsCard(
+                securityInfo = securityInfo,
+                passwordInput = passwordInput,
+                pendingAction = pendingAction,
+                onPasswordChange = onPasswordChange,
+                onProtect = onProtect,
+                onUnprotect = onUnprotect
+            )
+        }
+        item { InlinePagerNavBar(currentStep = currentStep, onBack = onBack) }
+    }
+}
+
+@Composable
+private fun CompactTopBlock(
+    currentStep: Int,
+    pendingAction: PendingAction,
+    showNfcDisabledDialog: Boolean,
+    statusMessage: String,
+    title: String,
+    description: String,
+    onStepSelected: (Int) -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        StepperHeader(currentStep = currentStep, onStepSelected = onStepSelected)
+        StateBanner(
+            pendingAction = pendingAction,
+            showNfcDisabledDialog = showNfcDisabledDialog,
+            statusMessage = statusMessage
+        )
+        PageHeader(title = title, description = description)
+    }
+}
+
+@Composable
+private fun InlinePagerNavBar(
+    currentStep: Int,
+    onBack: (() -> Unit)? = null,
+    onNext: (() -> Unit)? = null
+) {
+    Surface(
+        shape = RoundedCornerShape(22.dp),
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.94f),
+        tonalElevation = 2.dp
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(12.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            OutlinedButton(onClick = { onBack?.invoke() }, enabled = onBack != null) {
+                Text("Back")
+            }
+            Text(
+                text = "Step ${currentStep + 1} of 3",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Button(onClick = { onNext?.invoke() }, enabled = onNext != null) {
+                Text(if (currentStep == 2 || onNext == null) "Done" else "Next")
+            }
+        }
+    }
+}
+
+@Composable
+private fun PageHeader(title: String, description: String) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(text = title, style = MaterialTheme.typography.headlineMedium)
+        Text(
+            text = description,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+}
+
+@Composable
+private fun SummaryTile(label: String, value: String) {
+    Surface(
+        shape = RoundedCornerShape(20.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.75f)
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Text(text = label, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(text = value, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
+        }
+    }
+}
+
+@Composable
+private fun EmptyStateCard(title: String, message: String) {
+    Surface(
+        shape = RoundedCornerShape(24.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f)
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Text(text = title, style = MaterialTheme.typography.titleLarge)
+            Text(text = message, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+@Composable
+private fun RecordEditorCard(
+    index: Int,
+    record: NdefTextCodec.EditableRecord,
+    onRecordChange: (Int, String) -> Unit,
+    onRemoveRecord: (Int) -> Unit
+) {
+    Surface(
+        shape = RoundedCornerShape(24.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(text = "${record.type.displayName} record ${index + 1}", style = MaterialTheme.typography.titleMedium)
+                OutlinedButton(onClick = { onRemoveRecord(index) }) {
+                    Text("Remove")
+                }
+            }
+            OutlinedTextField(
+                value = record.value,
+                onValueChange = { onRecordChange(index, it) },
+                label = { Text(record.type.newRecordLabel) },
+                keyboardOptions = KeyboardOptions(keyboardType = record.type.keyboardType),
+                modifier = Modifier.fillMaxWidth(),
+                minLines = if (record.type == NdefTextCodec.EditableRecordType.TEXT) 3 else 1
+            )
+        }
+    }
+}
+
+@Composable
+private fun AddRecordCard(
+    newRecordType: NdefTextCodec.EditableRecordType,
+    newRecordValue: String,
+    onNewRecordTypeChange: (NdefTextCodec.EditableRecordType) -> Unit,
+    onNewRecordChange: (String) -> Unit,
+    onAddRecord: () -> Unit,
+    canAddRecord: Boolean
+) {
+    Surface(
+        shape = RoundedCornerShape(24.dp),
+        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f)
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Text(text = "Add a new record", style = MaterialTheme.typography.titleLarge)
+            RecordTypePicker(
+                selectedType = newRecordType,
+                onTypeSelected = onNewRecordTypeChange
+            )
+            OutlinedTextField(
+                value = newRecordValue,
+                onValueChange = onNewRecordChange,
+                label = { Text(newRecordType.newRecordLabel) },
+                keyboardOptions = KeyboardOptions(keyboardType = newRecordType.keyboardType),
+                modifier = Modifier.fillMaxWidth(),
+                minLines = if (newRecordType == NdefTextCodec.EditableRecordType.TEXT) 3 else 1
+            )
+            Button(onClick = onAddRecord, enabled = canAddRecord, modifier = Modifier.fillMaxWidth()) {
+                Text("Add ${newRecordType.displayName.lowercase()} record")
+            }
+        }
+    }
+}
+
+@Composable
+private fun SecurityToolsCard(
+    securityInfo: Ntag215Manager.TagSecurityInfo?,
+    passwordInput: String,
+    pendingAction: PendingAction,
+    onPasswordChange: (String) -> Unit,
+    onProtect: () -> Unit,
+    onUnprotect: () -> Unit
+) {
+    Surface(
+        shape = RoundedCornerShape(24.dp),
+        color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.45f)
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Text(text = "NTAG215 security tools", style = MaterialTheme.typography.titleLarge)
+            if (securityInfo?.isNtag215 != true) {
+                Text(
+                    text = "Scan an NTAG215 tag to reveal password and protection tools.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            } else {
+                Text(
+                    text = securityInfo.describe(),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                OutlinedTextField(
+                    value = passwordInput,
+                    onValueChange = onPasswordChange,
+                    label = { Text("NTAG215 password (4 chars or 8 hex)") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    FilledTonalButton(onClick = onProtect, modifier = Modifier.weight(1f)) {
+                        Text(if (pendingAction == PendingAction.PROTECT) "Tap to protect" else "Protect tag")
+                    }
+                    OutlinedButton(onClick = onUnprotect, modifier = Modifier.weight(1f)) {
+                        Text(if (pendingAction == PendingAction.UNPROTECT) "Tap to unlock" else "Remove password")
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -583,25 +1168,23 @@ private fun RecordTypePicker(
     selectedType: NdefTextCodec.EditableRecordType,
     onTypeSelected: (NdefTextCodec.EditableRecordType) -> Unit
 ) {
-    NdefTextCodec.EditableRecordType.values().toList().chunked(2).forEach { rowTypes ->
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            rowTypes.forEach { type ->
-                val buttonModifier = Modifier.weight(1f)
-                if (type == selectedType) {
-                    Button(onClick = { onTypeSelected(type) }, modifier = buttonModifier) {
-                        Text(type.displayName)
-                    }
-                } else {
-                    OutlinedButton(onClick = { onTypeSelected(type) }, modifier = buttonModifier) {
-                        Text(type.displayName)
-                    }
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        NdefTextCodec.EditableRecordType.values().toList().chunked(2).forEach { rowTypes ->
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                rowTypes.forEach { type ->
+                    FilterChip(
+                        selected = type == selectedType,
+                        onClick = { onTypeSelected(type) },
+                        label = { Text(type.displayName) },
+                        modifier = Modifier.weight(1f)
+                    )
                 }
-            }
-            if (rowTypes.size == 1) {
-                Column(modifier = Modifier.weight(1f)) {}
+                if (rowTypes.size == 1) {
+                    Spacer(modifier = Modifier.weight(1f))
+                }
             }
         }
     }
@@ -620,7 +1203,7 @@ private val NdefTextCodec.EditableRecordType.keyboardType: KeyboardType
 fun GreetingPreview() {
     NfcDroidTheme {
         NfcEditorScreen(
-            statusMessage = "Scan an NFC tag to load editable records.",
+            statusMessage = "Tag loaded. Swipe through scan, edit, and write when ready.",
             records = listOf(
                 NdefTextCodec.EditableRecord(
                     originalRecordIndex = 0,
@@ -644,6 +1227,7 @@ fun GreetingPreview() {
                 pack = byteArrayOf(0x00, 0x00)
             ),
             pendingAction = PendingAction.NONE,
+            currentStep = EditorStep.SCAN,
             showNfcDisabledDialog = false,
             onRecordChange = { _, _ -> },
             onRemoveRecord = {},
@@ -654,6 +1238,7 @@ fun GreetingPreview() {
             onWrite = {},
             onProtect = {},
             onUnprotect = {},
+            onStepChange = {},
             onOpenNfcSettings = {},
             canAddRecord = false
         )

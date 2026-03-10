@@ -1,7 +1,9 @@
 <resources>
     <string name="app_name">NfcDroid</string>
+    <string name="hero_tagline">Scan, edit, and write NFC tags in three focused steps.</string>
     <string name="ntag_password_label">NTAG215 password (4 chars or 8 hex)</string>
     <string name="ntag_protect_tag">Protect tag</string>
     <string name="ntag_remove_password">Remove password</string>
     <string name="ntag_write_tag">Write tag</string>
+    <string name="open_nfc_settings">Open NFC settings</string>
 </resources>
