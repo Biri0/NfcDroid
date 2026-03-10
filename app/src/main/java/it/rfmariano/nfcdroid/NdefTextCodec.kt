@@ -118,9 +118,9 @@ object NdefTextCodec {
                 )
             }
 
-            record.type.contentEquals(NdefRecord.RTD_URI) -> decodeUriPayload(record.payload)?.let { uri ->
-                uriToEditableRecord(index, uri)
-            }
+            record.type.contentEquals(NdefRecord.RTD_URI) -> uriToEditableRecord(index,
+                decodeUriPayload(record.payload)
+            )
 
             else -> null
         }
@@ -154,7 +154,7 @@ object NdefTextCodec {
         }
     }
 
-    private fun decodeUriPayload(payload: ByteArray): String? {
+    private fun decodeUriPayload(payload: ByteArray): String {
         if (payload.isEmpty()) return ""
         val prefixIndex = payload[0].toInt() and 0xFF
         val prefix = URI_PREFIXES.getOrElse(prefixIndex) { "" }
