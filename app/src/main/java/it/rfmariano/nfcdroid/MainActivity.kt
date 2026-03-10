@@ -6,7 +6,6 @@ import android.nfc.NfcAdapter
 import android.nfc.Tag
 import android.nfc.tech.Ndef
 import android.os.Bundle
-import android.os.Handler
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -35,13 +34,14 @@ import androidx.compose.ui.unit.dp
 import it.rfmariano.nfcdroid.ui.theme.NfcDroidTheme
 import java.io.IOException
 
-class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
-    private enum class WriteState {
-        IDLE,
-        WAITING_REMOVAL,
-        WAITING_NEXT_SCAN
-    }
+enum class PendingAction {
+    NONE,
+    WRITE,
+    PROTECT,
+    UNPROTECT
+}
 
+class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
     private sealed interface WriteMessagePreparation {
         data class Ready(val message: NdefMessage) : WriteMessagePreparation
         data object Empty : WriteMessagePreparation
@@ -54,8 +54,9 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
     private var editableRecords by mutableStateOf<List<NdefTextCodec.EditableRecord>>(emptyList())
     private var newRecordType by mutableStateOf(NdefTextCodec.EditableRecordType.TEXT)
     private var newRecordValue by mutableStateOf("")
-    private var writeState by mutableStateOf(WriteState.IDLE)
-    private var armedTagId: ByteArray? = null
+    private var passwordInput by mutableStateOf("")
+    private var pendingAction by mutableStateOf(PendingAction.NONE)
+    private var tagSecurityInfo by mutableStateOf<Ntag215Manager.TagSecurityInfo?>(null)
     private var statusMessage by mutableStateOf("Scan an NFC tag to load editable records.")
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -73,6 +74,9 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
                         records = editableRecords,
                         newRecordType = newRecordType,
                         newRecordValue = newRecordValue,
+                        passwordInput = passwordInput,
+                        securityInfo = tagSecurityInfo,
+                        pendingAction = pendingAction,
                         onRecordChange = { index, value ->
                             editableRecords = editableRecords.toMutableList().also {
                                 it[index] = it[index].copy(value = value)
@@ -83,6 +87,7 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
                         },
                         onNewRecordTypeChange = { newRecordType = it },
                         onNewRecordChange = { newRecordValue = it },
+                        onPasswordChange = { passwordInput = it },
                         onAddRecord = {
                             if (newRecordValue.isBlank()) {
                                 statusMessage = "${newRecordType.displayName} value cannot be blank."
@@ -96,9 +101,10 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
                                 newRecordValue = ""
                             }
                         },
-                        onWrite = { armWrite() },
+                        onWrite = { armAction(PendingAction.WRITE) },
+                        onProtect = { armAction(PendingAction.PROTECT) },
+                        onUnprotect = { armAction(PendingAction.UNPROTECT) },
                         canAddRecord = newRecordValue.isNotBlank(),
-                        isWriteArmed = writeState != WriteState.IDLE,
                         modifier = Modifier.padding(innerPadding)
                     )
                 }
@@ -127,26 +133,167 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
 
     override fun onTagDiscovered(tag: Tag) {
         val techSummary = tag.techList.joinToString(", ") { it.substringAfterLast('.') }
-        if (writeState == WriteState.WAITING_REMOVAL) {
-            runOnUiThread { statusMessage = "Write armed. Remove card from the phone first." }
+        val security = try {
+            Ntag215Manager.inspect(tag)
+        } catch (_: Exception) {
+            null
+        }
+
+        if (pendingAction != PendingAction.NONE) {
+            performPendingAction(tag, techSummary, security)
+        } else {
+            loadTag(tag, techSummary, security)
+        }
+    }
+
+    private fun armAction(action: PendingAction) {
+        if (action == PendingAction.WRITE && editableRecords.isEmpty()) {
+            statusMessage = "No editable records to write."
             return
         }
-        if (
-            writeState == WriteState.WAITING_NEXT_SCAN &&
-            armedTagId != null &&
-            !armedTagId!!.contentEquals(tag.id)
-        ) {
-            runOnUiThread { statusMessage = "Different tag detected. Tap the original card to write." }
+        pendingAction = action
+        currentTag = null
+        statusMessage = when (action) {
+            PendingAction.NONE -> "Scan an NFC tag to load editable records."
+            PendingAction.WRITE -> "Write armed. Tap tag to write."
+            PendingAction.PROTECT -> "Protection armed. Tap an NTAG215 to set the password."
+            PendingAction.UNPROTECT -> "Remove-password armed. Tap an NTAG215 and enter its password."
+        }
+    }
+
+    private fun performPendingAction(
+        tag: Tag,
+        techSummary: String,
+        security: Ntag215Manager.TagSecurityInfo?
+    ) {
+        try {
+            when (pendingAction) {
+                PendingAction.WRITE -> performWrite(tag, techSummary, security)
+                PendingAction.PROTECT -> performProtect(tag, techSummary)
+                PendingAction.UNPROTECT -> performUnprotect(tag, techSummary)
+                PendingAction.NONE -> loadTag(tag, techSummary, security)
+            }
+        } catch (exception: Exception) {
+            runOnUiThread {
+                pendingAction = PendingAction.NONE
+                statusMessage = exception.message ?: "Tag operation failed."
+            }
+        }
+    }
+
+    private fun performWrite(tag: Tag, techSummary: String, security: Ntag215Manager.TagSecurityInfo?) {
+        val writePreparation = buildMessageForWrite(originalMessage, editableRecords)
+        if (writePreparation !is WriteMessagePreparation.Ready) {
+            runOnUiThread {
+                pendingAction = PendingAction.NONE
+                statusMessage = when (writePreparation) {
+                    WriteMessagePreparation.Empty -> "Cannot write empty NDEF message."
+                    is WriteMessagePreparation.Invalid -> writePreparation.reason
+                    is WriteMessagePreparation.Ready -> "Preparing write."
+                }
+            }
+            return
+        }
+
+        val writeMessage = writePreparation.message
+        if (security?.isWriteProtected == true) {
+            if (passwordInput.isBlank()) {
+                runOnUiThread {
+                    pendingAction = PendingAction.NONE
+                    statusMessage = "This tag is password protected. Enter the password, then tap again."
+                }
+                return
+            }
+            val updatedSecurity = Ntag215Manager.writeProtectedNdef(tag, writeMessage, passwordInput)
+            runOnUiThread {
+                originalMessage = writeMessage
+                editableRecords = NdefTextCodec.editableRecordsFromMessage(writeMessage)
+                currentTag = tag
+                tagSecurityInfo = updatedSecurity
+                pendingAction = PendingAction.NONE
+                statusMessage = "Protected NTAG215 written successfully."
+            }
             return
         }
 
         val ndef = Ndef.get(tag)
         if (ndef == null) {
             runOnUiThread {
+                pendingAction = PendingAction.NONE
+                statusMessage = "NDEF unavailable. Detected technologies: $techSummary"
+            }
+            return
+        }
+
+        try {
+            ndef.connect()
+            if (!ndef.isWritable) {
+                runOnUiThread {
+                    pendingAction = PendingAction.NONE
+                    statusMessage = "Tag is read-only."
+                }
+                return
+            }
+            if (writeMessage.toByteArray().size > ndef.maxSize) {
+                runOnUiThread {
+                    pendingAction = PendingAction.NONE
+                    statusMessage = "NDEF message too large for this tag."
+                }
+                return
+            }
+            ndef.writeNdefMessage(writeMessage)
+            runOnUiThread {
+                originalMessage = writeMessage
+                editableRecords = NdefTextCodec.editableRecordsFromMessage(writeMessage)
+                currentTag = tag
+                tagSecurityInfo = security
+                pendingAction = PendingAction.NONE
+                statusMessage = "Tag written successfully."
+            }
+        } finally {
+            try {
+                ndef.close()
+            } catch (_: IOException) {
+            }
+        }
+    }
+
+    private fun performProtect(tag: Tag, techSummary: String) {
+        val updatedSecurity = Ntag215Manager.protect(tag, passwordInput, protectRead = false)
+        runOnUiThread {
+            currentTag = tag
+            tagSecurityInfo = updatedSecurity
+            pendingAction = PendingAction.NONE
+            statusMessage = "NTAG215 password set. Reads stay open, writes now require the password. Tech: $techSummary"
+        }
+    }
+
+    private fun performUnprotect(tag: Tag, techSummary: String) {
+        val updatedSecurity = Ntag215Manager.unprotect(tag, passwordInput)
+        runOnUiThread {
+            currentTag = tag
+            tagSecurityInfo = updatedSecurity
+            pendingAction = PendingAction.NONE
+            statusMessage = "NTAG215 password removed. Tag is writable again. Tech: $techSummary"
+        }
+    }
+
+    private fun loadTag(tag: Tag, techSummary: String, security: Ntag215Manager.TagSecurityInfo?) {
+        val ndef = Ndef.get(tag)
+        if (ndef == null) {
+            runOnUiThread {
                 currentTag = tag
                 originalMessage = null
                 editableRecords = emptyList()
-                statusMessage = "NDEF unavailable. Detected technologies: $techSummary"
+                tagSecurityInfo = security
+                statusMessage = buildString {
+                    append("NDEF unavailable. Detected technologies: ")
+                    append(techSummary)
+                    if (security?.isNtag215 == true) {
+                        append(". NTAG215 ")
+                        append(if (security.isWriteProtected) "is write-protected." else "has no password.")
+                    }
+                }
             }
             return
         }
@@ -155,65 +302,12 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
             ndef.connect()
             val message = ndef.cachedNdefMessage ?: ndef.ndefMessage
             val parsedRecords = NdefTextCodec.editableRecordsFromMessage(message)
-            val shouldWriteNow = writeState == WriteState.WAITING_NEXT_SCAN
-            val recordsSnapshot = editableRecords
-            val writePreparation = if (shouldWriteNow) {
-                buildMessageForWrite(message, recordsSnapshot)
-            } else {
-                null
-            }
-            if (shouldWriteNow && writePreparation != null && writePreparation !is WriteMessagePreparation.Ready) {
-                runOnUiThread {
-                    writeState = WriteState.IDLE
-                    armedTagId = null
-                    statusMessage = when (writePreparation) {
-                        WriteMessagePreparation.Empty -> "Cannot write empty NDEF message."
-                        is WriteMessagePreparation.Invalid -> writePreparation.reason
-                        is WriteMessagePreparation.Ready -> "Preparing write."
-                    }
-                }
-                return
-            }
-            val writeMessage = (writePreparation as? WriteMessagePreparation.Ready)?.message
             runOnUiThread {
                 currentTag = tag
                 originalMessage = message
                 editableRecords = parsedRecords
-                statusMessage = if (shouldWriteNow) {
-                    "Writing to tag..."
-                } else if (parsedRecords.isEmpty()) {
-                    "NDEF tag loaded. No editable records found. Tech: $techSummary"
-                } else {
-                    "NDEF tag loaded: ${parsedRecords.size} editable record(s). Tech: $techSummary"
-                }
-            }
-            if (shouldWriteNow) {
-                if (!ndef.isWritable) {
-                    runOnUiThread {
-                        writeState = WriteState.IDLE
-                        armedTagId = null
-                        statusMessage = "Tag is read-only."
-                    }
-                    return
-                }
-                val requiredSize = writeMessage!!.toByteArray().size
-                if (requiredSize > ndef.maxSize) {
-                    runOnUiThread {
-                        writeState = WriteState.IDLE
-                        armedTagId = null
-                        statusMessage = "NDEF message too large for this tag."
-                    }
-                    return
-                }
-                ndef.writeNdefMessage(writeMessage)
-                val updatedRecords = NdefTextCodec.editableRecordsFromMessage(writeMessage)
-                runOnUiThread {
-                    originalMessage = writeMessage
-                    editableRecords = updatedRecords
-                    writeState = WriteState.IDLE
-                    armedTagId = null
-                    statusMessage = "Tag written successfully."
-                }
+                tagSecurityInfo = security
+                statusMessage = buildStatusMessage(parsedRecords, techSummary, security)
             }
         } catch (ioException: IOException) {
             runOnUiThread {
@@ -231,48 +325,22 @@ class MainActivity : ComponentActivity(), NfcAdapter.ReaderCallback {
         }
     }
 
-    private fun armWrite() {
-        if (writeState != WriteState.IDLE) {
-            statusMessage = "Write is already armed. Remove and tap card to continue."
-            return
-        }
-
-        if (editableRecords.isEmpty()) {
-            statusMessage = "No editable records to write."
-            return
-        }
-
-        val tag = currentTag
-        if (tag == null) {
-            writeState = WriteState.WAITING_NEXT_SCAN
-            armedTagId = null
-            statusMessage = "Write armed. Tap card to write."
-            return
-        }
-
-        writeState = WriteState.WAITING_REMOVAL
-        armedTagId = tag.id
-        val ignoreStarted = nfcAdapter?.ignore(
-            tag,
-            250,
-            NfcAdapter.OnTagRemovedListener {
-                runOnUiThread {
-                    if (writeState == WriteState.WAITING_REMOVAL) {
-                        writeState = WriteState.WAITING_NEXT_SCAN
-                        currentTag = null
-                        statusMessage = "Card removed. Tap card again to write."
-                    }
-                }
-            },
-            Handler(mainLooper)
-        ) ?: false
-
-        if (ignoreStarted) {
-            statusMessage = "Write armed. Remove card from the phone."
+    private fun buildStatusMessage(
+        parsedRecords: List<NdefTextCodec.EditableRecord>,
+        techSummary: String,
+        security: Ntag215Manager.TagSecurityInfo?
+    ): String {
+        val base = if (parsedRecords.isEmpty()) {
+            "NDEF tag loaded. No editable records found."
         } else {
-            writeState = WriteState.WAITING_NEXT_SCAN
-            statusMessage = "Write armed. Remove card, then tap again to write."
+            "NDEF tag loaded: ${parsedRecords.size} editable record(s)."
         }
+        val securityText = when {
+            security?.isNtag215 != true -> ""
+            security.isWriteProtected -> " NTAG215 is write-protected. Enter password only when writing or removing protection."
+            else -> " NTAG215 has no password configured."
+        }
+        return "$base Tech: $techSummary.$securityText"
     }
 
     private fun buildMessageForWrite(
@@ -305,14 +373,19 @@ fun NfcEditorScreen(
     records: List<NdefTextCodec.EditableRecord>,
     newRecordType: NdefTextCodec.EditableRecordType,
     newRecordValue: String,
+    passwordInput: String,
+    securityInfo: Ntag215Manager.TagSecurityInfo?,
+    pendingAction: PendingAction,
     onRecordChange: (Int, String) -> Unit,
     onRemoveRecord: (Int) -> Unit,
     onNewRecordTypeChange: (NdefTextCodec.EditableRecordType) -> Unit,
     onNewRecordChange: (String) -> Unit,
+    onPasswordChange: (String) -> Unit,
     onAddRecord: () -> Unit,
     onWrite: () -> Unit,
+    onProtect: () -> Unit,
+    onUnprotect: () -> Unit,
     canAddRecord: Boolean,
-    isWriteArmed: Boolean,
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -323,6 +396,28 @@ fun NfcEditorScreen(
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         Text(text = statusMessage)
+        Text(text = securityInfo.describe())
+
+        OutlinedTextField(
+            value = passwordInput,
+            onValueChange = onPasswordChange,
+            label = { Text("NTAG215 password (4 chars or 8 hex)") },
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+            modifier = Modifier.fillMaxWidth()
+        )
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            Button(onClick = onWrite, modifier = Modifier.weight(1f)) {
+                Text(if (pendingAction == PendingAction.WRITE) "Tap tag to write" else "Write tag")
+            }
+            OutlinedButton(onClick = onProtect, modifier = Modifier.weight(1f)) {
+                Text(if (pendingAction == PendingAction.PROTECT) "Tap to protect" else "Protect tag")
+            }
+        }
+
+        OutlinedButton(onClick = onUnprotect, modifier = Modifier.fillMaxWidth()) {
+            Text(if (pendingAction == PendingAction.UNPROTECT) "Tap to remove password" else "Remove password")
+        }
 
         records.forEachIndexed { index, record ->
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
@@ -351,14 +446,19 @@ fun NfcEditorScreen(
             keyboardOptions = KeyboardOptions(keyboardType = newRecordType.keyboardType),
             modifier = Modifier.fillMaxWidth()
         )
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = onAddRecord, enabled = canAddRecord) {
-                Text("Add ${newRecordType.displayName.lowercase()} record")
-            }
-            Button(onClick = onWrite) {
-                Text(if (isWriteArmed) "Write armed" else "Write tag")
-            }
+        OutlinedButton(onClick = onAddRecord, enabled = canAddRecord) {
+            Text("Add ${newRecordType.displayName.lowercase()} record")
         }
+    }
+}
+
+private fun Ntag215Manager.TagSecurityInfo?.describe(): String {
+    if (this == null) return "No NTAG215 security info for the current tag yet."
+    if (!isNtag215) return "Current tag is not an NTAG215."
+    return if (isWriteProtected) {
+        "NTAG215 status: password enabled for writes from page $auth0Page."
+    } else {
+        "NTAG215 status: no password configured."
     }
 }
 
@@ -419,14 +519,25 @@ fun GreetingPreview() {
             ),
             newRecordType = NdefTextCodec.EditableRecordType.TEXT,
             newRecordValue = "",
+            passwordInput = "A1B2",
+            securityInfo = Ntag215Manager.TagSecurityInfo(
+                isNtag215 = true,
+                isWriteProtected = true,
+                auth0Page = 4,
+                protectRead = false,
+                pack = byteArrayOf(0x00, 0x00)
+            ),
+            pendingAction = PendingAction.NONE,
             onRecordChange = { _, _ -> },
             onRemoveRecord = {},
             onNewRecordTypeChange = {},
             onNewRecordChange = {},
+            onPasswordChange = {},
             onAddRecord = {},
             onWrite = {},
-            canAddRecord = false,
-            isWriteArmed = false
+            onProtect = {},
+            onUnprotect = {},
+            canAddRecord = false
         )
     }
 }
